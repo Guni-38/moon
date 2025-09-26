@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
-<title>指合わせゲーム</title>
+<title>ET 指合わせゲーム（自動難易度スケーリング）</title>
 <style>
   body{margin:0;background:#000;overflow:hidden;}
   canvas{display:block;background:#000;}
   #retryBtn{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);padding:14px 28px;font-size:18px;display:none;}
-  #dbgBtn{display:none;}  /* ← ボタン非表示 */
   #sndBtn{position:fixed;right:90px;top:10px;z-index:2;padding:8px 10px;font-size:12px;}
+  #dbgBtn{display:none;} /* デバッグボタンは非表示（Dキーで切替可能） */
 </style>
 </head>
 <body>
@@ -23,56 +23,98 @@
 const cvs = document.getElementById('game');
 const ctx  = cvs.getContext('2d');
 function fit(){ cvs.width = innerWidth; cvs.height = innerHeight; }
-addEventListener('resize', fit); fit();
+addEventListener('resize', ()=>{ fit(); recomputeLayout(); }); fit();
 
-/* ========= 当たり帯・先端設定 ========= */
+/* ========= 帯・先端の基本設定（割合ベース） =========
+   ※ 数値は実機を見ながら微調整してください */
 const HIT_BAND_L = [0.58, 0.72]; // 左画像の当たり帯（上0〜下1）
 const HIT_BAND_R = [0.58, 0.72]; // 右画像の当たり帯（上0〜下1）
-const TIP_OFFSET_RIGHT = 0; // finger1右端から内側へpx
-const TIP_OFFSET_LEFT  = 0; // finger2左端から内側へpx
-const REQ_X = 8;            // 横の食い込み(px)
-const REQ_Y = 8;            // 縦の重なり(px)
+const TIP_OFFSET_RIGHT = 0; // finger1右端から内側へ(ソースpx)
+const TIP_OFFSET_LEFT  = 0; // finger2左端から内側へ(ソースpx)
 
 /* ========= 画像（file:// OK） ========= */
 const imgL = new Image(); imgL.src = './finger1.png';
 const imgR = new Image(); imgR.src = './finger2.png';
-const GFX = {ready:false, loadedL:false, loadedR:false};
-imgL.onload = ()=>{ GFX.loadedL = true; if(GFX.loadedR) GFX.ready = true; };
-imgR.onload = ()=>{ GFX.loadedR = true; if(GFX.loadedL) GFX.ready = true; };
+const GFX = {ready:false, loadedL:false, loadedR:false, ratioL:1, ratioR:1};
+imgL.onload = ()=>{ GFX.loadedL = true; GFX.ratioL = imgL.naturalHeight / imgL.naturalWidth; if(GFX.loadedR){ GFX.ready = true; recomputeLayout(); } };
+imgR.onload = ()=>{ GFX.loadedR = true; GFX.ratioR = imgR.naturalHeight / imgR.naturalWidth; if(GFX.loadedL){ GFX.ready = true; recomputeLayout(); } };
 
 /* ========= サウンド ========= */
-/* 同じフォルダに bgm.mp3 / se_success.mp3 / se_fail.mp3 を置く */
-const bgm = new Audio('./bgm.mp3'); bgm.loop = true; bgm.volume = 0.4;
+const bgm = new Audio('./bgm.mp3'); bgm.loop = true; bgm.volume = 0.35;
 const seOK = new Audio('./se_success.mp3'); seOK.volume = 0.9;
 const seNG = new Audio('./se_fail.mp3');    seNG.volume = 0.9;
 
-let soundEnabled = false; // 最初はOFF（初回タップでON）
+let soundEnabled = false;
 const sndBtn = document.getElementById('sndBtn');
 function setSound(on){
   soundEnabled = on;
   sndBtn.textContent = 'SOUND: ' + (on ? 'ON' : 'OFF');
-  if (on){
-    // 再生を試みる（モバイルはユーザー操作後ならOK）
-    bgm.play().catch(()=>{ /* 失敗時は次のタップで再試行 */ });
-  } else {
-    bgm.pause();
-  }
+  if (on){ bgm.play().catch(()=>{}); } else { bgm.pause(); }
 }
 sndBtn.onclick = ()=> setSound(!soundEnabled);
 addEventListener('keydown', e=>{ if(e.key.toLowerCase()==='m') setSound(!soundEnabled); });
 
 /* ========= 状態 ========= */
 let level=1, lives=3, msg='', msgT=0, over=false, debug=false;
-document.getElementById('dbgBtn').onclick = ()=> debug=!debug;
 addEventListener('keydown', e=>{ if(e.key.toLowerCase()==='d') debug=!debug; });
 
-const left  = { x:cvs.width*0.30, y:cvs.height/2, w:120, h:120, vy:300, moving:true,  goRight:false };
-const right = { x:cvs.width*0.60, y:cvs.height/2, w:120, h:120, vy:0,   moving:false };
+/* 指スプライト（サイズや速度はrecomputeLayoutで決定） */
+const left  = { x:0, y:0, w:120, h:120, vy:300, moving:true,  goRight:false };
+const right = { x:0, y:0, w:120, h:120, vy:0,   moving:false };
+
+/* ====== 難易度スケーリング関連 ====== */
+let H_BAND_THICK = 0;   // 帯の実ピクセル厚
+let REQ_X = 8;          // 横食い込み要求(ピクセル) ※動的に再計算
+let REQ_Y = 8;          // 縦重なり要求(ピクセル)   ※動的に再計算
+let HORIZ_SPEED = 300;  // 水平速さ(px/s)           ※動的に再計算
+
+function recomputeLayout(){
+  if (!GFX.ready) return;
+
+  // 基準値：画面の短辺をベースに統一感のある縮尺に
+  const base = Math.min(cvs.width, cvs.height);
+
+  // 指の高さを画面高さに対する割合で決定（小画面ほど相対的に小さく）
+  // 例：22%（スマホ縦画面で見やすく、難易度も担保）
+  const targetH = Math.max(64, Math.round(cvs.height * 0.22));
+
+  // 元画像のアスペクト比に合わせてw,hを決める
+  left.h  = targetH;
+  left.w  = Math.round(left.h / (GFX.ratioL || 1));
+  right.h = targetH;
+  right.w = Math.round(right.h / (GFX.ratioR || 1));
+
+  // 配置の初期位置（左右間隔も画面幅比で調整）
+  const gap = Math.max(0.22 * cvs.width, left.w * 1.6); // 指の幅にも依存させる
+  left.x  = cvs.width * 0.5 - gap/2 - left.w*0.1;
+  right.x = cvs.width * 0.5 + gap/2 + right.w*0.1;
+  left.y = right.y = cvs.height / 2;
+
+  // 縦速度：画面高さに比例（体感一定に）
+  left.vy  = (0.9 * cvs.height) * (1 + (level-1)*0.08);
+  right.vy = (level>=5) ? (0.22 * cvs.height) * (1 + (level-5)*0.06) : 0;
+  right.moving = (level>=5);
+
+  // 水平速度：画面幅に比例
+  HORIZ_SPEED = 0.55 * cvs.width + level * 8;
+
+  // 帯の実ピクセル厚と、オーバーラップ要求を「比率」から決定
+  const lBandTop = left.y - left.h/2  + left.h  * HIT_BAND_L[0];
+  const lBandBot = left.y - left.h/2  + left.h  * HIT_BAND_L[1];
+  H_BAND_THICK = lBandBot - lBandTop;
+
+  // 横は指幅に対する比率、縦は帯厚に対する比率で決定（小画面ほど厳しく）
+  REQ_X = Math.max(4, Math.round(left.w * 0.08));      // 指幅の8%
+  REQ_Y = Math.max(6, Math.round(H_BAND_THICK * 0.5)); // 帯厚の50%
+
+  // 左の上下移動を再開
+  left.moving = true; left.goRight = false;
+}
 
 function resetLevel(){
-  left.x=cvs.width*0.30; left.y=cvs.height/2; left.vy=300+(level-1)*30; left.moving=true; left.goRight=false;
-  right.x=cvs.width*0.60; right.y=50+Math.random()*(cvs.height-100);
-  right.vy=(level>=5)?(50+(level-5)*20):0; right.moving=(level>=5);
+  recomputeLayout(); // 画面サイズ・レベルに応じて毎回再計算
+  // 右の初期Yはランダム
+  right.y = 50 + Math.random()*(cvs.height-100);
 }
 function resetGame(){
   level=1; lives=3; msg=''; msgT=0; over=false;
@@ -97,13 +139,13 @@ let prev=performance.now();
 requestAnimationFrame(loop);
 function loop(now){ const dt=Math.min(0.033,(now-prev)/1000); prev=now; update(dt); draw(); requestAnimationFrame(loop); }
 
-/* ========= 当たり帯＆先端計算 ========= */
+/* ========= 帯＆先端 ========= */
 function getTipRects(){
-  const swL = imgL.naturalWidth || 1,  swR = imgR.naturalWidth || 1;
-  const sL  = left.w / swL,            sR  = right.w / swR;
+  const sL  = left.w  / (imgL.naturalWidth || 1);
+  const sR  = right.w / (imgR.naturalWidth || 1);
 
-  const lRight = left.x + left.w/2  - (TIP_OFFSET_RIGHT * sL); // 左先端（右端）
-  const rLeft  = right.x - right.w/2 + (TIP_OFFSET_LEFT  * sR); // 右先端（左端）
+  const lRight = left.x + left.w/2  - (TIP_OFFSET_RIGHT * sL);
+  const rLeft  = right.x - right.w/2 + (TIP_OFFSET_LEFT  * sR);
 
   const lRect = { x:left.x-left.w/2,  y:left.y-left.h/2,  w:left.w,  h:left.h };
   const rRect = { x:right.x-right.w/2,y:right.y-right.h/2, w:right.w, h:right.h };
@@ -120,6 +162,7 @@ function getTipRects(){
 function update(dt){
   if (over || !GFX.ready) return;
 
+  // 上下運動
   if (left.moving){
     left.y += left.vy*dt;
     if (left.y<50){ left.y=50; left.vy*=-1; }
@@ -131,8 +174,9 @@ function update(dt){
     if (right.y>cvs.height-50){ right.y=cvs.height-50; right.vy*=-1; }
   }
 
+  // 右へ移動
   if (left.goRight){
-    left.x += (200 + level*20) * dt;
+    left.x += HORIZ_SPEED * dt;
 
     const T = getTipRects();
     const overlapX = T.lRight - T.rLeft;
@@ -160,11 +204,14 @@ function draw(){
   const W=cvs.width, H=cvs.height;
   ctx.clearRect(0,0,W,H);
 
-  // 星空
+  // 背景：星＋月
   ctx.fillStyle='#fff';
-  for(let i=0;i<120;i++){ const x=(i*97 + Date.now()/50)%W, y=(i*53)%H; ctx.fillRect(x,y,2,2); }
-  // 月
-  ctx.beginPath(); ctx.arc(W/2,H/2,Math.min(W,H)/4,0,Math.PI*2);
+  for(let i=0;i<Math.min(160, Math.round(W*H/15000)); i++){ // 画面面積に応じて星数調整
+    const x=(i*97 + Date.now()/50)%W, y=(i*53)%H;
+    ctx.fillRect(x,y,2,2);
+  }
+  ctx.beginPath();
+  ctx.arc(W/2, H/2, Math.min(W,H)/4, 0, Math.PI*2);
   ctx.fillStyle='lightyellow'; ctx.shadowColor='rgba(255,255,200,.7)'; ctx.shadowBlur=50; ctx.fill(); ctx.shadowBlur=0;
 
   if (!GFX.ready){
@@ -183,39 +230,44 @@ function draw(){
   ctx.fillText('Level: '+level, 20, 30);
   ctx.fillStyle='red'; ctx.font='24px system-ui,sans-serif';
   ctx.fillText('♥'.repeat(lives), 20, 60);
-  if (msgT>0){ ctx.fillStyle='yellow'; ctx.font='40px system-ui,sans-serif'; ctx.textAlign='center'; ctx.fillText(msg, W/2, H/4); }
-  if (over){
-    ctx.fillStyle='red';
-    ctx.font='50px system-ui,sans-serif';
-    ctx.textAlign='center';
-    ctx.fillText('GAME OVER', W/2, H/2);
 
-    ctx.fillStyle='blue';
-    ctx.font='28px system-ui,sans-serif';
-    ctx.fillText(`あなたの記録は Level:${level-1} です`, W/2, H/2 + 50);
+  if (msgT>0){
+    ctx.fillStyle='yellow'; ctx.font='40px system-ui,sans-serif'; ctx.textAlign='center';
+    ctx.fillText(msg, W/2, H/4);
   }
 
-  // デバッグ可視化
+  if (over){
+    ctx.fillStyle='red'; ctx.font='50px system-ui,sans-serif'; ctx.textAlign='center';
+    ctx.fillText('GAME OVER', W/2, H/2);
+    ctx.fillStyle='white'; ctx.font='28px system-ui,sans-serif';
+    ctx.fillText(`あなたの記録は Level.${level} です`, W/2, H/2 + 50);
+  }
+
+  // デバッグ（Dキーで切替）
   if (debug && GFX.ready){
     const T = getTipRects();
     // 先端ライン
     ctx.strokeStyle='#00e5ff'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(T.lRight,0); ctx.lineTo(T.lRight,H); ctx.stroke();
-    ctx.strokeStyle='#ff9e00'; ctx.beginPath(); ctx.moveTo(T.rLeft,0);  ctx.lineTo(T.rLeft,H); ctx.stroke();
+    ctx.strokeStyle='#ff9e00'; ctx.beginPath(); ctx.moveTo(T.rLeft,0); ctx.lineTo(T.rLeft,H); ctx.stroke();
     // 帯
     ctx.fillStyle='rgba(0,229,255,0.18)'; ctx.fillRect(T.lRect.x, T.lTop, T.lRect.w, T.lBot - T.lTop);
     ctx.fillStyle='rgba(255,158,0,0.18)'; ctx.fillRect(T.rRect.x, T.rTop, T.rRect.w, T.rBot - T.rTop);
     // 外枠
-    ctx.strokeStyle='#ffffff'; ctx.strokeRect(T.lRect.x, T.lRect.y, T.lRect.w, T.lRect.h);
-    ctx.strokeStyle='#ffffff'; ctx.strokeRect(T.rRect.x, T.rRect.y, T.rRect.w, T.rRect.h);
+    ctx.strokeStyle='#ffffff';
+    ctx.strokeRect(T.lRect.x, T.lRect.y, T.lRect.w, T.lRect.h);
+    ctx.strokeRect(T.rRect.x, T.rRect.y, T.rRect.w, T.rRect.h);
     // 数値
     const overlapX = T.lRight - T.rLeft;
     const overlapY = Math.min(T.lBot, T.rBot) - Math.max(T.lTop, T.rTop);
     ctx.fillStyle='#0ff'; ctx.font='14px ui-monospace, Menlo, monospace';
     ctx.fillText(`overlapX:${overlapX.toFixed(1)}  overlapY:${overlapY.toFixed(1)}`, 20, 90);
-    ctx.fillText(`lRight:${T.lRight.toFixed(1)}  rLeft:${T.rLeft.toFixed(1)}`, 20, 110);
-    ctx.fillText(`bandL:[${HIT_BAND_L.join(', ')}]  bandR:[${HIT_BAND_R.join(', ')}]`, 20, 130);
+    ctx.fillText(`REQ_X:${REQ_X}  REQ_Y:${REQ_Y}`, 20, 110);
+    ctx.fillText(`w:${left.w} h:${left.h} vy:${left.vy.toFixed(0)} hs:${HORIZ_SPEED.toFixed(0)}`, 20, 130);
   }
 }
+
+/* ========= 初期BGM対応 ========= */
+addEventListener('touchstart', ()=>{ if(!soundEnabled) setSound(true); }, {passive:true});
 </script>
 </body>
 </html>
