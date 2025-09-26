@@ -239,7 +239,7 @@ function draw(){
   if (over){
     ctx.fillStyle='red'; ctx.font='50px system-ui,sans-serif'; ctx.textAlign='center';
     ctx.fillText('GAME OVER', W/2, H/2);
-    ctx.fillStyle='white'; ctx.font='28px system-ui,sans-serif';
+    ctx.fillStyle='blue'; ctx.font='28px system-ui,sans-serif';
     ctx.fillText(`あなたの記録は Level.${level} です`, W/2, H/2 + 50);
   }
 
@@ -271,3 +271,4 @@ addEventListener('touchstart', ()=>{ if(!soundEnabled) setSound(true); }, {passi
 </script>
 </body>
 </html>
+
