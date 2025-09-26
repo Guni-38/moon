@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<title>指合わせゲーム</title>
+<style>
+  body{margin:0;background:#000;overflow:hidden;}
+  canvas{display:block;background:#000;}
+  #retryBtn{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);padding:14px 28px;font-size:18px;display:none;}
+  #dbgBtn{display:none;}  /* ← ボタン非表示 */
+  #sndBtn{position:fixed;right:90px;top:10px;z-index:2;padding:8px 10px;font-size:12px;}
+</style>
+</head>
+<body>
+<button id="sndBtn">SOUND: OFF</button>
+<button id="dbgBtn">DEBUG</button>
+<canvas id="game"></canvas>
+<button id="retryBtn">リトライ</button>
+
+<script>
+/* ========= Canvas ========= */
+const cvs = document.getElementById('game');
+const ctx  = cvs.getContext('2d');
+function fit(){ cvs.width = innerWidth; cvs.height = innerHeight; }
+addEventListener('resize', fit); fit();
+
+/* ========= 当たり帯・先端設定 ========= */
+const HIT_BAND_L = [0.58, 0.72]; // 左画像の当たり帯（上0〜下1）
+const HIT_BAND_R = [0.58, 0.72]; // 右画像の当たり帯（上0〜下1）
+const TIP_OFFSET_RIGHT = 0; // finger1右端から内側へpx
+const TIP_OFFSET_LEFT  = 0; // finger2左端から内側へpx
+const REQ_X = 8;            // 横の食い込み(px)
+const REQ_Y = 8;            // 縦の重なり(px)
+
+/* ========= 画像（file:// OK） ========= */
+const imgL = new Image(); imgL.src = './finger1.png';
+const imgR = new Image(); imgR.src = './finger2.png';
+const GFX = {ready:false, loadedL:false, loadedR:false};
+imgL.onload = ()=>{ GFX.loadedL = true; if(GFX.loadedR) GFX.ready = true; };
+imgR.onload = ()=>{ GFX.loadedR = true; if(GFX.loadedL) GFX.ready = true; };
+
+/* ========= サウンド ========= */
+/* 同じフォルダに bgm.mp3 / se_success.mp3 / se_fail.mp3 を置く */
+const bgm = new Audio('./bgm.mp3'); bgm.loop = true; bgm.volume = 0.4;
+const seOK = new Audio('./se_success.mp3'); seOK.volume = 0.9;
+const seNG = new Audio('./se_fail.mp3');    seNG.volume = 0.9;
+
+let soundEnabled = false; // 最初はOFF（初回タップでON）
+const sndBtn = document.getElementById('sndBtn');
+function setSound(on){
+  soundEnabled = on;
+  sndBtn.textContent = 'SOUND: ' + (on ? 'ON' : 'OFF');
+  if (on){
+    // 再生を試みる（モバイルはユーザー操作後ならOK）
+    bgm.play().catch(()=>{ /* 失敗時は次のタップで再試行 */ });
+  } else {
+    bgm.pause();
+  }
+}
+sndBtn.onclick = ()=> setSound(!soundEnabled);
+addEventListener('keydown', e=>{ if(e.key.toLowerCase()==='m') setSound(!soundEnabled); });
+
+/* ========= 状態 ========= */
+let level=1, lives=3, msg='', msgT=0, over=false, debug=false;
+document.getElementById('dbgBtn').onclick = ()=> debug=!debug;
+addEventListener('keydown', e=>{ if(e.key.toLowerCase()==='d') debug=!debug; });
+
+const left  = { x:cvs.width*0.30, y:cvs.height/2, w:120, h:120, vy:300, moving:true,  goRight:false };
+const right = { x:cvs.width*0.60, y:cvs.height/2, w:120, h:120, vy:0,   moving:false };
+
+function resetLevel(){
+  left.x=cvs.width*0.30; left.y=cvs.height/2; left.vy=300+(level-1)*30; left.moving=true; left.goRight=false;
+  right.x=cvs.width*0.60; right.y=50+Math.random()*(cvs.height-100);
+  right.vy=(level>=5)?(50+(level-5)*20):0; right.moving=(level>=5);
+}
+function resetGame(){
+  level=1; lives=3; msg=''; msgT=0; over=false;
+  document.getElementById('retryBtn').style.display='none';
+  resetLevel();
+}
+resetGame();
+
+/* ========= 入力 ========= */
+cvs.addEventListener('click', ()=>{
+  if (!soundEnabled) setSound(true); // 初回タップでBGM開始
+  if (over || !GFX.ready) return;
+  if (left.moving && !left.goRight){ left.moving=false; left.goRight=true; }
+});
+document.getElementById('retryBtn').addEventListener('click', ()=>{
+  if (!soundEnabled) setSound(true);
+  resetGame();
+});
+
+/* ========= ループ ========= */
+let prev=performance.now();
+requestAnimationFrame(loop);
+function loop(now){ const dt=Math.min(0.033,(now-prev)/1000); prev=now; update(dt); draw(); requestAnimationFrame(loop); }
+
+/* ========= 当たり帯＆先端計算 ========= */
+function getTipRects(){
+  const swL = imgL.naturalWidth || 1,  swR = imgR.naturalWidth || 1;
+  const sL  = left.w / swL,            sR  = right.w / swR;
+
+  const lRight = left.x + left.w/2  - (TIP_OFFSET_RIGHT * sL); // 左先端（右端）
+  const rLeft  = right.x - right.w/2 + (TIP_OFFSET_LEFT  * sR); // 右先端（左端）
+
+  const lRect = { x:left.x-left.w/2,  y:left.y-left.h/2,  w:left.w,  h:left.h };
+  const rRect = { x:right.x-right.w/2,y:right.y-right.h/2, w:right.w, h:right.h };
+
+  const lTop = lRect.y + left.h  * HIT_BAND_L[0];
+  const lBot = lRect.y + left.h  * HIT_BAND_L[1];
+  const rTop = rRect.y + right.h * HIT_BAND_R[0];
+  const rBot = rRect.y + right.h * HIT_BAND_R[1];
+
+  return { lRight, rLeft, lTop, lBot, rTop, rBot, lRect, rRect };
+}
+
+/* ========= 更新 ========= */
+function update(dt){
+  if (over || !GFX.ready) return;
+
+  if (left.moving){
+    left.y += left.vy*dt;
+    if (left.y<50){ left.y=50; left.vy*=-1; }
+    if (left.y>cvs.height-50){ left.y=cvs.height-50; left.vy*=-1; }
+  }
+  if (right.moving){
+    right.y += right.vy*dt;
+    if (right.y<50){ right.y=50; right.vy*=-1; }
+    if (right.y>cvs.height-50){ right.y=cvs.height-50; right.vy*=-1; }
+  }
+
+  if (left.goRight){
+    left.x += (200 + level*20) * dt;
+
+    const T = getTipRects();
+    const overlapX = T.lRight - T.rLeft;
+    const overlapY = Math.min(T.lBot, T.rBot) - Math.max(T.lTop, T.rTop);
+
+    if (overlapX >= REQ_X && overlapY >= REQ_Y){
+      if (soundEnabled){ try{ seOK.currentTime=0; seOK.play(); }catch(e){} }
+      level++; msg='レベルアップ！'; msgT=2; resetLevel();
+    } else if (T.lRight > T.rLeft + REQ_X){
+      lives--;
+      if (soundEnabled){ try{ seNG.currentTime=0; seNG.play(); }catch(e){} }
+      if (lives<=0){
+        over=true; document.getElementById('retryBtn').style.display='block';
+      } else {
+        msg='ミス！'; msgT=1.5; resetLevel();
+      }
+    }
+  }
+
+  if (msgT>0) msgT-=dt;
+}
+
+/* ========= 描画 ========= */
+function draw(){
+  const W=cvs.width, H=cvs.height;
+  ctx.clearRect(0,0,W,H);
+
+  // 星空
+  ctx.fillStyle='#fff';
+  for(let i=0;i<120;i++){ const x=(i*97 + Date.now()/50)%W, y=(i*53)%H; ctx.fillRect(x,y,2,2); }
+  // 月
+  ctx.beginPath(); ctx.arc(W/2,H/2,Math.min(W,H)/4,0,Math.PI*2);
+  ctx.fillStyle='lightyellow'; ctx.shadowColor='rgba(255,255,200,.7)'; ctx.shadowBlur=50; ctx.fill(); ctx.shadowBlur=0;
+
+  if (!GFX.ready){
+    ctx.fillStyle='#fff'; ctx.font='28px system-ui,sans-serif'; ctx.textAlign='center';
+    ctx.fillText('LOADING…', W/2, H/2);
+  }
+
+  // 指
+  if (GFX.ready){
+    ctx.drawImage(imgL, left.x-left.w/2, left.y-left.h/2, left.w, left.h);
+    ctx.drawImage(imgR, right.x-right.w/2, right.y-right.h/2, right.w, right.h);
+  }
+
+  // HUD
+  ctx.fillStyle='#fff'; ctx.font='20px system-ui,sans-serif'; ctx.textAlign='left';
+  ctx.fillText('Level: '+level, 20, 30);
+  ctx.fillStyle='red'; ctx.font='24px system-ui,sans-serif';
+  ctx.fillText('♥'.repeat(lives), 20, 60);
+  if (msgT>0){ ctx.fillStyle='yellow'; ctx.font='40px system-ui,sans-serif'; ctx.textAlign='center'; ctx.fillText(msg, W/2, H/4); }
+  if (over){
+    ctx.fillStyle='red';
+    ctx.font='50px system-ui,sans-serif';
+    ctx.textAlign='center';
+    ctx.fillText('GAME OVER', W/2, H/2);
+
+    ctx.fillStyle='blue';
+    ctx.font='28px system-ui,sans-serif';
+    ctx.fillText(`あなたの記録は Level:${level-1} です`, W/2, H/2 + 50);
+  }
+
+  // デバッグ可視化
+  if (debug && GFX.ready){
+    const T = getTipRects();
+    // 先端ライン
+    ctx.strokeStyle='#00e5ff'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(T.lRight,0); ctx.lineTo(T.lRight,H); ctx.stroke();
+    ctx.strokeStyle='#ff9e00'; ctx.beginPath(); ctx.moveTo(T.rLeft,0);  ctx.lineTo(T.rLeft,H); ctx.stroke();
+    // 帯
+    ctx.fillStyle='rgba(0,229,255,0.18)'; ctx.fillRect(T.lRect.x, T.lTop, T.lRect.w, T.lBot - T.lTop);
+    ctx.fillStyle='rgba(255,158,0,0.18)'; ctx.fillRect(T.rRect.x, T.rTop, T.rRect.w, T.rBot - T.rTop);
+    // 外枠
+    ctx.strokeStyle='#ffffff'; ctx.strokeRect(T.lRect.x, T.lRect.y, T.lRect.w, T.lRect.h);
+    ctx.strokeStyle='#ffffff'; ctx.strokeRect(T.rRect.x, T.rRect.y, T.rRect.w, T.rRect.h);
+    // 数値
+    const overlapX = T.lRight - T.rLeft;
+    const overlapY = Math.min(T.lBot, T.rBot) - Math.max(T.lTop, T.rTop);
+    ctx.fillStyle='#0ff'; ctx.font='14px ui-monospace, Menlo, monospace';
+    ctx.fillText(`overlapX:${overlapX.toFixed(1)}  overlapY:${overlapY.toFixed(1)}`, 20, 90);
+    ctx.fillText(`lRight:${T.lRight.toFixed(1)}  rLeft:${T.rLeft.toFixed(1)}`, 20, 110);
+    ctx.fillText(`bandL:[${HIT_BAND_L.join(', ')}]  bandR:[${HIT_BAND_R.join(', ')}]`, 20, 130);
+  }
+}
+</script>
+</body>
+</html>
